@@ -785,7 +785,7 @@ def main() -> None:
         with col3:
             limit = st.number_input(
                 "Límite de keywords a traer",
-                min_value=500, max_value=20000, value=5000, step=500,
+                min_value=500, max_value=20000, value=500, step=500,
                 help="Cuantas más, más unidades de Ahrefs consume.",
             )
         with col4:
