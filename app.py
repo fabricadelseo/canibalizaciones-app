@@ -168,7 +168,6 @@ def fetch_organic_keywords(
         "date": on_date,
         "select": ORGANIC_KW_FIELDS,
         "order_by": "keyword_difficulty:desc",
-        "output": "json",
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
