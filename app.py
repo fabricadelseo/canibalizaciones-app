@@ -220,18 +220,35 @@ def read_top_pages_csv(file_bytes: bytes) -> pd.DataFrame:
     else:
         df = pd.read_csv(io.BytesIO(file_bytes))
 
-    # Mapeo de columnas Top Pages → formato organic-keywords interno.
+    # Mapeo de columnas Organic Keywords export → formato interno.
     rename_map = {
+        # Formato Organic Keywords (export estándar Ahrefs)
+        "Keyword": "keyword",
+        "Current URL": "url",
+        "Current position": "best_position",
+        "Volume": "volume",
+        "KD": "keyword_difficulty",
+        "Current organic traffic": "traffic",
+        "Branded": "is_branded",
+        "Commercial": "is_commercial",
+        "Informational": "is_informational",
+        "Navigational": "is_navigational",
+        "Transactional": "is_transactional",
+        # Formato Top Pages (fallback legacy)
         "URL": "url",
         "Top keyword": "keyword",
         "Top keyword: Position": "best_position",
-        "Volume": "volume",
         "Current traffic": "traffic",
         "Top keyword KD": "keyword_difficulty",
     }
     for k, v in rename_map.items():
-        if k in df.columns:
+        if k in df.columns and v not in df.columns:
             df = df.rename(columns={k: v})
+
+    # Normalizar flags booleanos (Ahrefs exporta "true"/"false" como string)
+    for flag in ("is_branded", "is_commercial", "is_informational", "is_navigational", "is_transactional"):
+        if flag in df.columns:
+            df[flag] = df[flag].map({"true": True, "false": False, True: True, False: False})
 
     return df
 
