@@ -96,8 +96,18 @@ def detect_intent_for_group(group: pd.DataFrame) -> str:
 def detect_page_type(url: str) -> str:
     """Heurística simple por URL: blog / categoría / producto / servicio / home."""
     u = (url or "").lower()
-    if u.endswith("/") and u.count("/") <= 3:
+    o = urlparse(u)
+    path = o.path or "/"
+
+    # Home: path = "/" o path = "/<idioma>/" (p.ej. "/en/", "/es/")
+    if path == "/" or path == "":
         return "home"
+    # Path tipo /en/ — solo un segmento corto que sea idioma conocido
+    parts = [p for p in path.split("/") if p]
+    if len(parts) == 1 and len(parts[0]) == 2:
+        # 2 letras → probable código de idioma (en, es, fr, de, etc.)
+        return "home"
+
     for marker, label in [
         ("/blog/", "blog"),
         ("/noticias/", "blog"),
