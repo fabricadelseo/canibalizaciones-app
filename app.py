@@ -831,13 +831,12 @@ def main() -> None:
     # --- CSV ---------------------------------------------------------------
     with tab_csv:
         st.markdown(
-            "Fallback: sube el CSV de **Top Pages** de Ahrefs (formato del Colab original). "
-            "⚠️ Top Pages tiene **menos detalle** que Organic keywords: solo ve la "
-            "*Top keyword* de cada URL, así que se escapan canibalizaciones de keywords "
-            "secundarias. Se recomienda usar la API."
+            "Exporta el CSV de **Organic Keywords** desde Ahrefs: "
+            "Site Explorer → dominio → **Organic keywords** → botón Exportar. "
+            "Detecta canibalizaciones reales entre todas las parejas keyword × URL."
         )
         uploaded = st.file_uploader(
-            "Sube el CSV de Top Pages", type=["csv"], accept_multiple_files=False,
+            "Sube el CSV de Organic Keywords", type=["csv"], accept_multiple_files=False,
         )
         if uploaded:
             try:
