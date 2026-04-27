@@ -149,9 +149,9 @@ def fetch_organic_keywords(
     on_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Llama a /site-explorer/organic-keywords y devuelve un DataFrame con todas
-    las parejas (keyword × URL) que rankean para el target.
-    Docs: https://docs.ahrefs.com/api/reference/site-explorer/get-organic-keywords
+    Llama a /site-explorer/organic-keywords con paginación automática.
+    El plan actual devuelve 25 filas/request, así que paginamos con offset
+    hasta alcanzar el límite solicitado o agotar los resultados.
     """
     if not api_key:
         raise ValueError("Falta la API key de Ahrefs.")
@@ -160,42 +160,57 @@ def fetch_organic_keywords(
 
     on_date = on_date or date.today().isoformat()
 
-    params = {
-        "target": target,
-        "country": country,
-        "mode": mode,
-        "limit": limit,
-        "date": on_date,
-        "select": ORGANIC_KW_FIELDS,
-        "order_by": "keyword_difficulty:desc",
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
     }
 
-    resp = requests.get(
-        f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
-        params=params,
-        headers=headers,
-        timeout=90,
-    )
+    all_rows = []
+    offset = 0
+    page_size = 25  # límite real devuelto por el plan actual
 
-    if resp.status_code == 401:
-        raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
-    if resp.status_code == 403:
-        raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
-    if resp.status_code == 429:
-        raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
-    if not resp.ok:
-        raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
+    while len(all_rows) < limit:
+        params = {
+            "target": target,
+            "country": country,
+            "mode": mode,
+            "limit": page_size,
+            "offset": offset,
+            "date": on_date,
+            "select": ORGANIC_KW_FIELDS,
+            "order_by": "keyword_difficulty:desc",
+        }
 
-    payload = resp.json()
-    rows = payload.get("keywords") or payload.get("data") or []
-    if not rows:
+        resp = requests.get(
+            f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
+            params=params,
+            headers=headers,
+            timeout=90,
+        )
+
+        if resp.status_code == 401:
+            raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
+        if resp.status_code == 403:
+            raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
+        if resp.status_code == 429:
+            raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
+        if not resp.ok:
+            raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
+
+        payload = resp.json()
+        rows = payload.get("keywords") or payload.get("data") or []
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break  # última página
+        offset += len(rows)
+
+    if not all_rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows[:limit])
 
     # Normaliza nombre de la URL (la API usa best_position_url).
     if "best_position_url" in df.columns:
