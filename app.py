@@ -135,7 +135,7 @@ def detect_page_type(url: str) -> str:
 
 ORGANIC_KW_FIELDS = (
     "keyword,best_position,best_position_url,volume,keyword_difficulty,"
-    "traffic,cpc,is_branded,is_commercial,is_informational,"
+    "cpc,is_branded,is_commercial,is_informational,"
     "is_navigational,is_transactional"
 )
 
