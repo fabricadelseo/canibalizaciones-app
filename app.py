@@ -167,7 +167,7 @@ def fetch_organic_keywords(
         "limit": limit,
         "date": on_date,
         "select": ORGANIC_KW_FIELDS,
-        "order_by": "traffic:desc",
+        "order_by": "keyword_difficulty:desc",
         "output": "json",
     }
     headers = {
