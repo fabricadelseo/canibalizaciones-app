@@ -165,52 +165,38 @@ def fetch_organic_keywords(
         "Accept": "application/json",
     }
 
-    all_rows = []
-    offset = 0
-    page_size = 25  # límite real devuelto por el plan actual
+    params = {
+        "target": target,
+        "country": country,
+        "mode": mode,
+        "limit": limit,
+        "date": on_date,
+        "select": ORGANIC_KW_FIELDS,
+        "order_by": "keyword_difficulty:desc",
+    }
 
-    while len(all_rows) < limit:
-        params = {
-            "target": target,
-            "country": country,
-            "mode": mode,
-            "limit": page_size,
-            "offset": offset,
-            "date": on_date,
-            "select": ORGANIC_KW_FIELDS,
-            "order_by": "keyword_difficulty:desc",
-        }
+    resp = requests.get(
+        f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
+        params=params,
+        headers=headers,
+        timeout=90,
+    )
 
-        resp = requests.get(
-            f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
-            params=params,
-            headers=headers,
-            timeout=90,
-        )
+    if resp.status_code == 401:
+        raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
+    if resp.status_code == 403:
+        raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
+    if resp.status_code == 429:
+        raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
+    if not resp.ok:
+        raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
 
-        if resp.status_code == 401:
-            raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
-        if resp.status_code == 403:
-            raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
-        if resp.status_code == 429:
-            raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
-        if not resp.ok:
-            raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
-
-        payload = resp.json()
-        rows = payload.get("keywords") or payload.get("data") or []
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-        if len(rows) < page_size:
-            break  # última página
-        offset += len(rows)
-
-    if not all_rows:
+    payload = resp.json()
+    rows = payload.get("keywords") or payload.get("data") or []
+    if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows[:limit])
+    df = pd.DataFrame(rows)
 
     # Normaliza nombre de la URL (la API usa best_position_url).
     if "best_position_url" in df.columns:
