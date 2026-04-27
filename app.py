@@ -22,12 +22,9 @@ import io
 import json
 import os
 import time
-from datetime import date
-from typing import Optional
 from urllib.parse import urlparse
 
 import pandas as pd
-import requests
 import streamlit as st
 from anthropic import Anthropic, APIError
 
@@ -43,20 +40,6 @@ st.set_page_config(
 )
 
 CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
-AHREFS_BASE_URL = "https://api.ahrefs.com/v3"
-
-COUNTRIES = {
-    "es": "España", "us": "Estados Unidos", "mx": "México", "ar": "Argentina",
-    "co": "Colombia", "cl": "Chile", "pe": "Perú", "fr": "Francia",
-    "it": "Italia", "pt": "Portugal", "de": "Alemania", "uk": "Reino Unido",
-}
-
-MODES = {
-    "subdomains": "Dominio + subdominios",
-    "domain": "Solo dominio principal",
-    "prefix": "Prefijo (sección)",
-    "exact": "URL exacta",
-}
 
 # CTR aproximado por posición (Sistrix / Advanced Web Ranking 2024).
 # Usado para estimar tráfico potencial perdido por canibalización.
@@ -132,79 +115,6 @@ def detect_page_type(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Cliente Ahrefs API v3 — organic-keywords
 # ---------------------------------------------------------------------------
-
-ORGANIC_KW_FIELDS = (
-    "keyword,best_position,best_position_url,volume,keyword_difficulty,"
-    "cpc,is_branded,is_commercial,is_informational,"
-    "is_navigational,is_transactional"
-)
-
-
-def fetch_organic_keywords(
-    api_key: str,
-    target: str,
-    country: str,
-    mode: str = "subdomains",
-    limit: int = 5000,
-    on_date: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Llama a /site-explorer/organic-keywords con paginación automática.
-    El plan actual devuelve 25 filas/request, así que paginamos con offset
-    hasta alcanzar el límite solicitado o agotar los resultados.
-    """
-    if not api_key:
-        raise ValueError("Falta la API key de Ahrefs.")
-    if not target:
-        raise ValueError("Falta el dominio objetivo.")
-
-    on_date = on_date or date.today().isoformat()
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    params = {
-        "target": target,
-        "country": country,
-        "mode": mode,
-        "limit": limit,
-        "date": on_date,
-        "select": ORGANIC_KW_FIELDS,
-        "order_by": "keyword_difficulty:desc",
-    }
-
-    resp = requests.get(
-        f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
-        params=params,
-        headers=headers,
-        timeout=90,
-    )
-
-    if resp.status_code == 401:
-        raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
-    if resp.status_code == 403:
-        raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
-    if resp.status_code == 429:
-        raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
-    if not resp.ok:
-        raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
-
-    payload = resp.json()
-    rows = payload.get("keywords") or payload.get("data") or []
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-
-    # Normaliza nombre de la URL (la API usa best_position_url).
-    if "best_position_url" in df.columns:
-        df = df.rename(columns={"best_position_url": "url"})
-    elif "url" not in df.columns:
-        raise RuntimeError("La respuesta de Ahrefs no contiene URL de ranking.")
-
-    return df
 
 
 def read_top_pages_csv(file_bytes: bytes) -> pd.DataFrame:
@@ -710,7 +620,7 @@ def main() -> None:
 
     st.title("🥩 Detector de Canibalizaciones SEO")
     st.caption(
-        "Detecta canibalizaciones reales en proyectos SEO usando Ahrefs API. "
+        "Detecta canibalizaciones reales en proyectos SEO. "
         "Calcula severidad, prioriza por impacto y sugiere acciones con Claude."
     )
 
@@ -723,22 +633,9 @@ def main() -> None:
             value=_get_secret("ANTHROPIC_API_KEY"),
             help="En Streamlit Cloud → Secrets como ANTHROPIC_API_KEY.",
         )
-        ahrefs_key = st.text_input(
-            "Ahrefs API Key", type="password",
-            value=_get_secret("AHREFS_API_KEY"),
-            help="En Streamlit Cloud → Secrets como AHREFS_API_KEY.",
-        )
         client_name = st.text_input(
             "Nombre del cliente", placeholder="Ej. Cronomía",
             help="Se usa en el nombre del Excel.",
-        )
-
-        st.divider()
-        country_code = st.selectbox(
-            "País",
-            options=list(COUNTRIES.keys()),
-            format_func=lambda c: f"{c.upper()} · {COUNTRIES[c]}",
-            index=0,
         )
 
         st.divider()
@@ -761,96 +658,27 @@ def main() -> None:
             min_value=1, max_value=500, value=50, step=10,
         )
 
-    # --- Tabs --------------------------------------------------------------
-    tab_api, tab_csv = st.tabs(["🔗 API Ahrefs (recomendado)", "📄 CSV (fallback)"])
-
-    # --- API ---------------------------------------------------------------
-    with tab_api:
-        st.markdown(
-            "Trae **todas las parejas keyword × URL** del informe `Organic keywords` "
-            "de Ahrefs. Detecta canibalizaciones reales (la misma keyword rankeando "
-            "en varias URLs simultáneamente)."
-        )
-
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            target = st.text_input(
-                "Dominio objetivo", placeholder="ej. cronomia.com",
-                help="Sin http:// ni www.",
-            )
-        with col2:
-            mode_label = st.selectbox(
-                "Modo", options=list(MODES.keys()),
-                format_func=lambda m: MODES[m], index=0,
-            )
-
-        col3, col4 = st.columns(2)
-        with col3:
-            limit = st.number_input(
-                "Límite de keywords a traer",
-                min_value=500, max_value=20000, value=500, step=500,
-                help="Cuantas más, más unidades de Ahrefs consume.",
-            )
-        with col4:
-            on_date = st.date_input("Fecha del informe", value=date.today())
-
-        if st.button("📥 Traer Organic keywords", type="primary", key="btn_fetch"):
-            if not ahrefs_key:
-                st.error("Falta la Ahrefs API Key.")
-            elif not target:
-                st.error("Introduce un dominio objetivo.")
-            else:
-                try:
-                    with st.spinner(f"Consultando Ahrefs ({target}, {country_code.upper()}, {MODES[mode_label]})…"):
-                        df = fetch_organic_keywords(
-                            api_key=ahrefs_key,
-                            target=target.strip(),
-                            country=country_code,
-                            mode=mode_label,
-                            limit=int(limit),
-                            on_date=on_date.isoformat(),
-                        )
-                    st.session_state["ahrefs_df"] = df
-                    st.success(f"✅ {len(df):,} keywords recibidas para {target}.")
-                except (PermissionError, ValueError, RuntimeError) as e:
-                    st.error(str(e))
-                except requests.RequestException as e:
-                    st.error(f"Error de red: {e}")
-
-        df_api = st.session_state.get("ahrefs_df")
-        if df_api is not None and not df_api.empty:
-            st.divider()
-            run_analysis(
-                df_api, client_name, use_claude, int(max_groups),
-                anthropic_key, int(max_position), int(min_volume),
-                button_key="btn_api",
-            )
-        elif df_api is not None:
-            st.info("Ahrefs no devolvió keywords para esos parámetros.")
-
     # --- CSV ---------------------------------------------------------------
-    with tab_csv:
-        st.markdown(
-            "Exporta el CSV de **Organic Keywords** desde Ahrefs: "
-            "Site Explorer → dominio → **Organic keywords** → botón Exportar. "
-            "Detecta canibalizaciones reales entre todas las parejas keyword × URL."
+    st.markdown(
+        "**Cómo exportar el CSV:** entra en Ahrefs → Site Explorer → introduce el dominio del cliente "
+        "→ menú izquierdo **Organic keywords** → botón **Exportar** (arriba a la derecha)."
+    )
+    uploaded = st.file_uploader(
+        "Sube el CSV de Organic Keywords", type=["csv"], accept_multiple_files=False,
+    )
+    if uploaded:
+        try:
+            df_csv = read_top_pages_csv(uploaded.getvalue())
+        except Exception as e:
+            st.error(f"No se pudo leer el CSV: {e}")
+            return
+        st.success(f"CSV cargado: {len(df_csv):,} filas.")
+        st.divider()
+        run_analysis(
+            df_csv, client_name, use_claude, int(max_groups),
+            anthropic_key, int(max_position), int(min_volume),
+            button_key="btn_csv",
         )
-        uploaded = st.file_uploader(
-            "Sube el CSV de Organic Keywords", type=["csv"], accept_multiple_files=False,
-        )
-        if uploaded:
-            try:
-                df_csv = read_top_pages_csv(uploaded.getvalue())
-            except Exception as e:
-                st.error(f"No se pudo leer el CSV: {e}")
-                return
-            st.success(f"CSV cargado: {len(df_csv):,} filas.")
-            st.divider()
-            run_analysis(
-                df_csv, client_name, use_claude, int(max_groups),
-                anthropic_key, int(max_position), int(min_volume),
-                button_key="btn_csv",
-            )
 
 
 if __name__ == "__main__":
