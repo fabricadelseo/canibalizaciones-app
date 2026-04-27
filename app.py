@@ -22,9 +22,12 @@ import io
 import json
 import os
 import time
+from datetime import date
+from typing import Optional
 from urllib.parse import urlparse
 
 import pandas as pd
+import requests
 import streamlit as st
 from anthropic import Anthropic, APIError
 
@@ -40,6 +43,20 @@ st.set_page_config(
 )
 
 CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+AHREFS_BASE_URL = "https://api.ahrefs.com/v3"
+
+COUNTRIES = {
+    "es": "España", "us": "Estados Unidos", "mx": "México", "ar": "Argentina",
+    "co": "Colombia", "cl": "Chile", "pe": "Perú", "fr": "Francia",
+    "it": "Italia", "pt": "Portugal", "de": "Alemania", "uk": "Reino Unido",
+}
+
+MODES = {
+    "subdomains": "Dominio + subdominios",
+    "domain": "Solo dominio principal",
+    "prefix": "Prefijo (sección)",
+    "exact": "URL exacta",
+}
 
 # CTR aproximado por posición (Sistrix / Advanced Web Ranking 2024).
 # Usado para estimar tráfico potencial perdido por canibalización.
@@ -72,18 +89,24 @@ def estimated_ctr(position: float) -> float:
     return CTR_BY_POSITION.get(p, 0.0)
 
 
-def detect_intent(row: pd.Series) -> str:
-    """Devuelve la intención dominante a partir de los flags de Ahrefs."""
-    flags = [
-        ("transaccional", row.get("is_transactional")),
-        ("comercial", row.get("is_commercial")),
-        ("informacional", row.get("is_informational")),
-        ("navegacional", row.get("is_navigational")),
-        ("branded", row.get("is_branded")),
-    ]
-    for name, val in flags:
-        if val is True or val == 1:
-            return name
+INTENT_PRIORITY = [
+    ("branded", "is_branded"),
+    ("transaccional", "is_transactional"),
+    ("comercial", "is_commercial"),
+    ("navegacional", "is_navigational"),
+    ("informacional", "is_informational"),
+]
+
+
+def detect_intent_for_group(group: pd.DataFrame) -> str:
+    """
+    Intención unificada por keyword: si CUALQUIER fila del grupo tiene un flag
+    activo, lo aplicamos al grupo entero. La prioridad va de más específico
+    (branded) a más genérico (informacional).
+    """
+    for label, col in INTENT_PRIORITY:
+        if col in group.columns and (group[col] == True).any():  # noqa: E712
+            return label
     return "desconocida"
 
 
@@ -112,9 +135,125 @@ def detect_page_type(url: str) -> str:
     return "página"
 
 
+# Subdirectorios típicos de idioma (ISO + algunos comunes).
+LANG_PREFIXES = {
+    "/en/", "/es/", "/fr/", "/de/", "/it/", "/pt/", "/ca/", "/eu/", "/gl/",
+    "/nl/", "/ru/", "/zh/", "/ja/", "/ar/", "/pl/",
+}
+
+
+def detect_lang_from_url(url: str) -> str:
+    """Devuelve el código de idioma detectado por path, o 'default'."""
+    u = (url or "").lower()
+    o = urlparse(u)
+    path = o.path or "/"
+    for prefix in LANG_PREFIXES:
+        if path.startswith(prefix):
+            return prefix.strip("/")
+    return "default"
+
+
+def classify_pattern(group: pd.DataFrame) -> str:
+    """
+    Clasifica el tipo de canibalización basándose en las URLs del grupo:
+      - "Idiomas distintos": las URLs están en directorios de idioma diferentes.
+      - "Blog vs categoría/producto": mezcla de tipos de página claros.
+      - "Producto vs categoría": un producto y una categoría compiten.
+      - "Mismo tipo de página": todas comparten tipo (la canibalización clásica).
+      - "Mixto": no encaja en los anteriores.
+    """
+    langs = group["url"].apply(detect_lang_from_url).unique()
+    types = group["page_type"].unique() if "page_type" in group.columns else []
+
+    if len(langs) > 1:
+        return "Idiomas distintos"
+
+    type_set = set(types)
+    if "blog" in type_set and (type_set & {"categoría", "producto", "servicio"}):
+        return "Blog vs comercial"
+    if {"producto", "categoría"}.issubset(type_set):
+        return "Producto vs categoría"
+    if len(type_set) == 1:
+        return f"Mismo tipo ({list(type_set)[0]})"
+    return "Mixto"
+
+
 # ---------------------------------------------------------------------------
 # Cliente Ahrefs API v3 — organic-keywords
 # ---------------------------------------------------------------------------
+
+ORGANIC_KW_FIELDS = (
+    "keyword,best_position,best_position_url,volume,keyword_difficulty,"
+    "traffic,cpc,is_branded,is_commercial,is_informational,"
+    "is_navigational,is_transactional"
+)
+
+
+def fetch_organic_keywords(
+    api_key: str,
+    target: str,
+    country: str,
+    mode: str = "subdomains",
+    limit: int = 5000,
+    on_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Llama a /site-explorer/organic-keywords y devuelve un DataFrame con todas
+    las parejas (keyword × URL) que rankean para el target.
+    Docs: https://docs.ahrefs.com/api/reference/site-explorer/get-organic-keywords
+    """
+    if not api_key:
+        raise ValueError("Falta la API key de Ahrefs.")
+    if not target:
+        raise ValueError("Falta el dominio objetivo.")
+
+    on_date = on_date or date.today().isoformat()
+
+    params = {
+        "target": target,
+        "country": country,
+        "mode": mode,
+        "limit": limit,
+        "date": on_date,
+        "select": ORGANIC_KW_FIELDS,
+        "order_by": "traffic:desc",
+        "output": "json",
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+    resp = requests.get(
+        f"{AHREFS_BASE_URL}/site-explorer/organic-keywords",
+        params=params,
+        headers=headers,
+        timeout=90,
+    )
+
+    if resp.status_code == 401:
+        raise PermissionError("API key de Ahrefs inválida o sin permisos (401).")
+    if resp.status_code == 403:
+        raise PermissionError("Acceso denegado por Ahrefs (403). Revisa el plan o los permisos.")
+    if resp.status_code == 429:
+        raise RuntimeError("Ahrefs ha devuelto rate limit (429). Reintenta en un minuto.")
+    if not resp.ok:
+        raise RuntimeError(f"Error Ahrefs {resp.status_code}: {resp.text[:300]}")
+
+    payload = resp.json()
+    rows = payload.get("keywords") or payload.get("data") or []
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Normaliza nombre de la URL (la API usa best_position_url).
+    if "best_position_url" in df.columns:
+        df = df.rename(columns={"best_position_url": "url"})
+    elif "url" not in df.columns:
+        raise RuntimeError("La respuesta de Ahrefs no contiene URL de ranking.")
+
+    return df
 
 
 def read_top_pages_csv(file_bytes: bytes) -> pd.DataFrame:
@@ -130,35 +269,18 @@ def read_top_pages_csv(file_bytes: bytes) -> pd.DataFrame:
     else:
         df = pd.read_csv(io.BytesIO(file_bytes))
 
-    # Mapeo de columnas Organic Keywords export → formato interno.
+    # Mapeo de columnas Top Pages → formato organic-keywords interno.
     rename_map = {
-        # Formato Organic Keywords (export estándar Ahrefs)
-        "Keyword": "keyword",
-        "Current URL": "url",
-        "Current position": "best_position",
-        "Volume": "volume",
-        "KD": "keyword_difficulty",
-        "Current organic traffic": "traffic",
-        "Branded": "is_branded",
-        "Commercial": "is_commercial",
-        "Informational": "is_informational",
-        "Navigational": "is_navigational",
-        "Transactional": "is_transactional",
-        # Formato Top Pages (fallback legacy)
         "URL": "url",
         "Top keyword": "keyword",
         "Top keyword: Position": "best_position",
+        "Volume": "volume",
         "Current traffic": "traffic",
         "Top keyword KD": "keyword_difficulty",
     }
     for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
+        if k in df.columns:
             df = df.rename(columns={k: v})
-
-    # Normalizar flags booleanos (Ahrefs exporta "true"/"false" como string)
-    for flag in ("is_branded", "is_commercial", "is_informational", "is_navigational", "is_transactional"):
-        if flag in df.columns:
-            df[flag] = df[flag].map({"true": True, "false": False, True: True, False: False})
 
     return df
 
@@ -209,12 +331,20 @@ def detect_canibalizations(
     if cannibal.empty:
         return cannibal
 
-    # Enriquecimiento: tipo de página + intención (si hay flags).
+    # Enriquecimiento: tipo de página (por fila).
     cannibal["page_type"] = cannibal["url"].apply(detect_page_type)
-    if any(c.startswith("is_") for c in cannibal.columns):
-        cannibal["intent"] = cannibal.apply(detect_intent, axis=1)
-    else:
-        cannibal["intent"] = "desconocida"
+
+    # Intención y patrón: a nivel de grupo (no por fila).
+    has_intent_flags = any(c.startswith("is_") for c in cannibal.columns)
+    intents_by_kw = {}
+    patterns_by_kw = {}
+    for kw, group in cannibal.groupby("keyword"):
+        intents_by_kw[kw] = (
+            detect_intent_for_group(group) if has_intent_flags else "desconocida"
+        )
+        patterns_by_kw[kw] = classify_pattern(group)
+    cannibal["intent"] = cannibal["keyword"].map(intents_by_kw)
+    cannibal["pattern"] = cannibal["keyword"].map(patterns_by_kw)
 
     return cannibal.sort_values(["keyword", "best_position"])
 
@@ -224,28 +354,34 @@ def score_group(group: pd.DataFrame) -> dict:
     Calcula severidad + score de impacto para un grupo canibalizado.
 
     Severidad:
-      - Alta: ≥2 URLs en top 10 y volumen ≥100, o intención comercial/transaccional con vol ≥50.
-      - Media: 1 URL en top 10 + otra en 11-20, o volumen 50-100.
-      - Baja: posiciones distantes / branded / volumen <50.
+      - Alta: ≥2 URLs en top 10 con vol ≥100, o
+              ≥1 URL en top 10 con intención comercial/transaccional y vol ≥150.
+      - Media: ≥1 URL en top 10 + otra entre 11-20, o
+               vol entre 50-150, o
+               intención comercial/transaccional con vol ≥50.
+      - Baja: branded, posiciones distantes, o vol <50.
 
-    Score = volumen × Σ CTR(posición) × nº URLs (más URLs = más fragmentación).
+    Score = volumen × Σ CTR(posición) × factor por nº URLs (penaliza fragmentación).
     """
     n_urls = group["url"].nunique()
     volume = float(group["volume"].iloc[0]) if "volume" in group.columns else 0.0
     positions = group["best_position"].astype(float).tolist()
     in_top10 = sum(1 for p in positions if p <= 10)
     intent = group["intent"].iloc[0] if "intent" in group.columns else "desconocida"
+    is_commercial_intent = intent in {"comercial", "transaccional"}
 
     # Severidad
     if intent == "branded":
         severity = "Baja"
     elif in_top10 >= 2 and volume >= 100:
         severity = "Alta"
-    elif intent in {"comercial", "transaccional"} and volume >= 50:
+    elif in_top10 >= 1 and is_commercial_intent and volume >= 150:
         severity = "Alta"
     elif in_top10 >= 1 and any(11 <= p <= 20 for p in positions):
         severity = "Media"
-    elif 50 <= volume < 100:
+    elif is_commercial_intent and volume >= 50:
+        severity = "Media"
+    elif 50 <= volume < 150:
         severity = "Media"
     else:
         severity = "Baja"
@@ -293,8 +429,15 @@ No inventes datos que no estén en el grupo. Sé específico."""
 
 def build_user_prompt(keyword: str, group: pd.DataFrame, score_data: dict) -> str:
     volume = group["volume"].iloc[0] if "volume" in group.columns else "N/D"
-    kd = group["keyword_difficulty"].iloc[0] if "keyword_difficulty" in group.columns else "N/D"
     intent = group["intent"].iloc[0] if "intent" in group.columns else "desconocida"
+    pattern = group["pattern"].iloc[0] if "pattern" in group.columns else "—"
+
+    # KD: solo lo añadimos si Ahrefs lo devolvió no-nulo.
+    kd_str = "N/D"
+    if "keyword_difficulty" in group.columns:
+        kd_clean = pd.to_numeric(group["keyword_difficulty"], errors="coerce").dropna()
+        if not kd_clean.empty:
+            kd_str = str(int(kd_clean.max()))
 
     rows = []
     for _, r in group.iterrows():
@@ -306,13 +449,23 @@ def build_user_prompt(keyword: str, group: pd.DataFrame, score_data: dict) -> st
             parts.append(f"Tipo: {r['page_type']}")
         rows.append("- " + " | ".join(parts))
 
+    pattern_hint = ""
+    if pattern == "Idiomas distintos":
+        pattern_hint = (
+            "\n\nNOTA: las URLs están en directorios de idioma diferentes. "
+            "Esto suele NO ser canibalización real sino un problema de hreflang. "
+            "Recomienda revisar la implementación de hreflang antes que redirigir, "
+            "salvo que un idioma rankee para keywords del otro y reste tráfico."
+        )
+
     return (
         f'Keyword canibalizada: "{keyword}"\n'
-        f'Volumen: {volume} | KD: {kd} | Intención: {intent} | '
-        f'Severidad calculada: {score_data["severity"]} | '
+        f'Volumen: {volume} | KD: {kd_str} | Intención: {intent} | '
+        f'Patrón: {pattern} | Severidad: {score_data["severity"]} | '
         f'URLs en top 10: {score_data["in_top10"]} de {score_data["n_urls"]}\n\n'
         f"URLs que compiten por esta keyword:\n"
         + "\n".join(rows)
+        + pattern_hint
         + "\n\nDevuélveme la acción recomendada en el JSON descrito."
     )
 
@@ -359,11 +512,14 @@ def build_excel(cannibal: pd.DataFrame, summary: pd.DataFrame) -> bytes:
         summary.to_excel(writer, sheet_name="Resumen", index=False)
 
         detail_cols = [
-            "keyword", "url", "best_position", "page_type", "intent",
+            "keyword", "url", "best_position", "page_type", "intent", "pattern",
         ]
         for opt in ("volume", "keyword_difficulty", "traffic"):
             if opt in cannibal.columns:
                 detail_cols.append(opt)
+
+        # Solo incluimos columnas que realmente existen
+        detail_cols = [c for c in detail_cols if c in cannibal.columns]
 
         merged = cannibal[detail_cols].merge(
             summary[["keyword", "Severidad", "Score impacto", "Acción",
@@ -483,12 +639,22 @@ def run_analysis(
     for kw, group in cannibal.groupby("keyword"):
         s = score_group(group)
         score_by_kw[kw] = s
+
+        # KD: solo lo incluimos si Ahrefs lo devuelve no-nulo en alguna fila.
+        # La API marca KD como nullable y a menudo viene a None.
+        kd_val = None
+        if "keyword_difficulty" in group.columns:
+            kd_series = pd.to_numeric(group["keyword_difficulty"], errors="coerce")
+            kd_series = kd_series.dropna()
+            kd_val = int(kd_series.max()) if not kd_series.empty else None
+
         summary_records.append({
             "keyword": kw,
+            "Patrón": group["pattern"].iloc[0] if "pattern" in group.columns else "—",
             "Nº URLs": s["n_urls"],
             "URLs en top 10": s["in_top10"],
             "Volumen": int(group["volume"].iloc[0]) if "volume" in group.columns else None,
-            "KD": int(group["keyword_difficulty"].iloc[0]) if "keyword_difficulty" in group.columns and pd.notna(group["keyword_difficulty"].iloc[0]) else None,
+            "KD": kd_val,
             "Intención": group["intent"].iloc[0] if "intent" in group.columns else "desconocida",
             "Severidad": s["severity"],
             "Score impacto": s["score"],
@@ -510,11 +676,24 @@ def run_analysis(
     c3.metric("🟡 Severidad media", int(sev_counts.get("Media", 0)))
     c4.metric("🟢 Severidad baja", int(sev_counts.get("Baja", 0)))
 
+    # NUEVO: resumen ejecutivo de patrones (mejora 4)
+    pattern_counts = summary["Patrón"].value_counts()
+    if len(pattern_counts) > 0 and pattern_counts.iloc[0] >= 2:
+        top_pattern = pattern_counts.index[0]
+        top_count = pattern_counts.iloc[0]
+        pct = top_count / len(summary) * 100
+        if pct >= 40:
+            st.info(
+                f"💡 **Patrón dominante detectado:** {pct:.0f}% de las canibalizaciones "
+                f"({top_count} de {len(summary)}) son del tipo **«{top_pattern}»**. "
+                f"Atacar la causa raíz puede resolver muchas a la vez."
+            )
+
     st.divider()
 
     # Filtros sobre el resumen
     st.subheader("Resumen priorizado")
-    fc1, fc2 = st.columns([1, 2])
+    fc1, fc2, fc3 = st.columns([1, 1, 1])
     with fc1:
         sev_filter = st.multiselect(
             "Filtrar por severidad",
@@ -530,10 +709,19 @@ def run_analysis(
             default=intent_options,
             key=f"int_{button_key}",
         )
+    with fc3:
+        pattern_options = sorted(summary["Patrón"].dropna().unique().tolist())
+        pattern_filter = st.multiselect(
+            "Filtrar por patrón",
+            pattern_options,
+            default=pattern_options,
+            key=f"pat_{button_key}",
+        )
 
     view = summary[
         summary["Severidad"].isin(sev_filter) &
-        summary["Intención"].isin(intent_filter)
+        summary["Intención"].isin(intent_filter) &
+        summary["Patrón"].isin(pattern_filter)
     ].reset_index(drop=True)
     st.dataframe(view, use_container_width=True, hide_index=True)
 
@@ -620,7 +808,7 @@ def main() -> None:
 
     st.title("🥩 Detector de Canibalizaciones SEO")
     st.caption(
-        "Detecta canibalizaciones reales en proyectos SEO. "
+        "Detecta canibalizaciones reales en proyectos SEO usando Ahrefs API. "
         "Calcula severidad, prioriza por impacto y sugiere acciones con Claude."
     )
 
@@ -633,9 +821,22 @@ def main() -> None:
             value=_get_secret("ANTHROPIC_API_KEY"),
             help="En Streamlit Cloud → Secrets como ANTHROPIC_API_KEY.",
         )
+        ahrefs_key = st.text_input(
+            "Ahrefs API Key", type="password",
+            value=_get_secret("AHREFS_API_KEY"),
+            help="En Streamlit Cloud → Secrets como AHREFS_API_KEY.",
+        )
         client_name = st.text_input(
             "Nombre del cliente", placeholder="Ej. Cronomía",
             help="Se usa en el nombre del Excel.",
+        )
+
+        st.divider()
+        country_code = st.selectbox(
+            "País",
+            options=list(COUNTRIES.keys()),
+            format_func=lambda c: f"{c.upper()} · {COUNTRIES[c]}",
+            index=0,
         )
 
         st.divider()
@@ -658,27 +859,97 @@ def main() -> None:
             min_value=1, max_value=500, value=50, step=10,
         )
 
-    # --- CSV ---------------------------------------------------------------
-    st.markdown(
-        "**Cómo exportar el CSV:** entra en Ahrefs → Site Explorer → introduce el dominio del cliente "
-        "→ menú izquierdo **Organic keywords** → botón **Exportar** (arriba a la derecha)."
-    )
-    uploaded = st.file_uploader(
-        "Sube el CSV de Organic Keywords", type=["csv"], accept_multiple_files=False,
-    )
-    if uploaded:
-        try:
-            df_csv = read_top_pages_csv(uploaded.getvalue())
-        except Exception as e:
-            st.error(f"No se pudo leer el CSV: {e}")
-            return
-        st.success(f"CSV cargado: {len(df_csv):,} filas.")
-        st.divider()
-        run_analysis(
-            df_csv, client_name, use_claude, int(max_groups),
-            anthropic_key, int(max_position), int(min_volume),
-            button_key="btn_csv",
+    # --- Tabs --------------------------------------------------------------
+    tab_api, tab_csv = st.tabs(["🔗 API Ahrefs (recomendado)", "📄 CSV (fallback)"])
+
+    # --- API ---------------------------------------------------------------
+    with tab_api:
+        st.markdown(
+            "Trae **todas las parejas keyword × URL** del informe `Organic keywords` "
+            "de Ahrefs. Detecta canibalizaciones reales (la misma keyword rankeando "
+            "en varias URLs simultáneamente)."
         )
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            target = st.text_input(
+                "Dominio objetivo", placeholder="ej. cronomia.com",
+                help="Sin http:// ni www.",
+            )
+        with col2:
+            mode_label = st.selectbox(
+                "Modo", options=list(MODES.keys()),
+                format_func=lambda m: MODES[m], index=0,
+            )
+
+        col3, col4 = st.columns(2)
+        with col3:
+            limit = st.number_input(
+                "Límite de keywords a traer",
+                min_value=500, max_value=20000, value=5000, step=500,
+                help="Cuantas más, más unidades de Ahrefs consume.",
+            )
+        with col4:
+            on_date = st.date_input("Fecha del informe", value=date.today())
+
+        if st.button("📥 Traer Organic keywords", type="primary", key="btn_fetch"):
+            if not ahrefs_key:
+                st.error("Falta la Ahrefs API Key.")
+            elif not target:
+                st.error("Introduce un dominio objetivo.")
+            else:
+                try:
+                    with st.spinner(f"Consultando Ahrefs ({target}, {country_code.upper()}, {MODES[mode_label]})…"):
+                        df = fetch_organic_keywords(
+                            api_key=ahrefs_key,
+                            target=target.strip(),
+                            country=country_code,
+                            mode=mode_label,
+                            limit=int(limit),
+                            on_date=on_date.isoformat(),
+                        )
+                    st.session_state["ahrefs_df"] = df
+                    st.success(f"✅ {len(df):,} keywords recibidas para {target}.")
+                except (PermissionError, ValueError, RuntimeError) as e:
+                    st.error(str(e))
+                except requests.RequestException as e:
+                    st.error(f"Error de red: {e}")
+
+        df_api = st.session_state.get("ahrefs_df")
+        if df_api is not None and not df_api.empty:
+            st.divider()
+            run_analysis(
+                df_api, client_name, use_claude, int(max_groups),
+                anthropic_key, int(max_position), int(min_volume),
+                button_key="btn_api",
+            )
+        elif df_api is not None:
+            st.info("Ahrefs no devolvió keywords para esos parámetros.")
+
+    # --- CSV ---------------------------------------------------------------
+    with tab_csv:
+        st.markdown(
+            "Fallback: sube el CSV de **Top Pages** de Ahrefs (formato del Colab original). "
+            "⚠️ Top Pages tiene **menos detalle** que Organic keywords: solo ve la "
+            "*Top keyword* de cada URL, así que se escapan canibalizaciones de keywords "
+            "secundarias. Se recomienda usar la API."
+        )
+        uploaded = st.file_uploader(
+            "Sube el CSV de Top Pages", type=["csv"], accept_multiple_files=False,
+        )
+        if uploaded:
+            try:
+                df_csv = read_top_pages_csv(uploaded.getvalue())
+            except Exception as e:
+                st.error(f"No se pudo leer el CSV: {e}")
+                return
+            st.success(f"CSV cargado: {len(df_csv):,} filas.")
+            st.divider()
+            run_analysis(
+                df_csv, client_name, use_claude, int(max_groups),
+                anthropic_key, int(max_position), int(min_volume),
+                button_key="btn_csv",
+            )
 
 
 if __name__ == "__main__":
