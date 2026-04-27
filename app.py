@@ -138,20 +138,36 @@ def detect_lang_from_url(url: str) -> str:
 
 def classify_pattern(group: pd.DataFrame) -> str:
     """
-    Clasifica el tipo de canibalización basándose en las URLs del grupo:
-      - "Idiomas distintos": las URLs están en directorios de idioma diferentes.
-      - "Blog vs categoría/producto": mezcla de tipos de página claros.
+    Clasifica el tipo de canibalización:
+      - "Idiomas distintos": URLs en directorios de idioma diferentes
+        (ambas con prefijo de idioma claro, no la home).
+      - "Falta versión idioma": una URL en /en/ y otra es la home — no es un
+        problema de hreflang sino de cobertura de contenido.
+      - "Blog vs comercial": mezcla blog + categoría/producto/servicio.
       - "Producto vs categoría": un producto y una categoría compiten.
-      - "Mismo tipo de página": todas comparten tipo (la canibalización clásica).
+      - "Mismo tipo": todas comparten tipo (canibalización clásica).
       - "Mixto": no encaja en los anteriores.
     """
-    langs = group["url"].apply(detect_lang_from_url).unique()
+    langs = group["url"].apply(detect_lang_from_url).tolist()
     types = group["page_type"].unique() if "page_type" in group.columns else []
+    type_set = set(types)
 
-    if len(langs) > 1:
+    distinct_langs = set(langs)
+    has_home = "home" in type_set
+
+    # Idiomas distintos REAL: 2+ prefijos de idioma claros, sin contar 'default'
+    explicit_langs = distinct_langs - {"default"}
+    if len(explicit_langs) >= 2:
         return "Idiomas distintos"
 
-    type_set = set(types)
+    # Si hay 1 idioma explícito + 1 default Y una URL es home → falta versión
+    if len(explicit_langs) == 1 and "default" in distinct_langs and has_home:
+        return "Falta versión idioma"
+
+    # Si hay 1 idioma explícito + 1 default sin home → idiomas distintos
+    if len(explicit_langs) == 1 and "default" in distinct_langs:
+        return "Idiomas distintos"
+
     if "blog" in type_set and (type_set & {"categoría", "producto", "servicio"}):
         return "Blog vs comercial"
     if {"producto", "categoría"}.issubset(type_set):
@@ -329,31 +345,34 @@ def score_group(group: pd.DataFrame) -> dict:
 ACTION_SYSTEM_PROMPT = """Eres un consultor SEO senior español especializado en \
 resolver canibalizaciones de keywords. Recibes un grupo de URLs que compiten \
 por la misma keyword, con datos de Ahrefs (volumen, KD, posición, tráfico, \
-intención, tipo de página).
+intención, tipo de página, patrón de canibalización).
 
 Devuelve UNA acción entre estas (usa el texto exacto):
-- "Consolidar": fusionar URLs en una y redirigir 301 las demás (misma intención).
-- "Redirigir 301": una URL es claramente mejor; las otras desaparecen y se redirigen.
-- "Desindexar": URLs sin tráfico ni intención propia (noindex o eliminar).
-- "Diferenciar intención": las URLs cubren intenciones distintas; reescribir y \
-reorientar enlazado interno.
-- "Reescribir y reforzar": hay una URL principal clara pero mal optimizada o sin autoridad.
-- "Mantener y monitorizar": canibalización leve (branded, posiciones distantes) sin acción.
+- "Consolidar": fusionar URLs en una y redirigir 301 las demás (misma intención, contenido duplicado).
+- "Redirigir 301": una URL es claramente superior; las demás desaparecen y se redirigen a ella.
+- "Desindexar": URLs sin tráfico ni intención propia (añadir noindex o eliminar página).
+- "Diferenciar intención": las URLs cubren intenciones distintas; reescribir y reorientar enlazado interno para que cada una satisfaga una intención única.
+- "Reescribir y reforzar": hay una URL principal clara pero está mal optimizada o carece de autoridad; potenciar esa URL sin eliminar las demás.
+- "Revisar hreflang": el patrón indica URLs en distintos idiomas o regiones; el problema es de hreflang, no de canibalización real. Corregir etiquetas antes de actuar.
+- "Crear contenido": falta una URL con la intención correcta; las existentes no son el tipo idóneo para la keyword (ej. solo hay un blog post para "comprar X").
+- "Mantener y monitorizar": canibalización leve (branded, posiciones distantes, volumen mínimo) sin acción urgente.
 
-Prioriza como URL principal la que tenga mejor combinación de: posición, tráfico, \
-y coherencia con la intención de la keyword (ej. para "comprar X", una página \
-de producto o categoría es mejor que un blog post).
+Prioriza como URL principal la que tenga mejor combinación de: posición más alta, \
+mayor tráfico y coherencia con la intención de la keyword \
+(ej. para "comprar X", producto o categoría > blog post).
 
 Responde SOLO un JSON válido (sin markdown, sin texto extra):
 
 {
   "accion": "<acción exacta de la lista>",
   "url_principal": "<URL canónica recomendada o '' si no aplica>",
-  "justificacion": "<2-3 frases concretas y accionables, en español, citando \
-los datos relevantes (posiciones, intención, tipo de página)>"
+  "diagnostico": "<1 frase que describe el problema raíz>",
+  "accion_concreta": "<pasos específicos a ejecutar, citando URLs y datos>",
+  "resultado_esperado": "<qué mejora SEO se espera tras aplicar la acción>"
 }
 
-No inventes datos que no estén en el grupo. Sé específico."""
+No inventes datos que no estén en el grupo. Sé específico y cita posiciones, \
+volúmenes o tipos de página cuando sea relevante."""
 
 
 def build_user_prompt(keyword: str, group: pd.DataFrame, score_data: dict) -> str:
@@ -361,12 +380,13 @@ def build_user_prompt(keyword: str, group: pd.DataFrame, score_data: dict) -> st
     intent = group["intent"].iloc[0] if "intent" in group.columns else "desconocida"
     pattern = group["pattern"].iloc[0] if "pattern" in group.columns else "—"
 
-    # KD: solo lo añadimos si Ahrefs lo devolvió no-nulo.
+    # KD: solo lo añadimos si Ahrefs lo devolvió no-nulo y no es 0.
     kd_str = "N/D"
     if "keyword_difficulty" in group.columns:
         kd_clean = pd.to_numeric(group["keyword_difficulty"], errors="coerce").dropna()
         if not kd_clean.empty:
-            kd_str = str(int(kd_clean.max()))
+            max_kd = int(kd_clean.max())
+            kd_str = str(max_kd) if max_kd > 0 else "N/D"
 
     rows = []
     for _, r in group.iterrows():
@@ -383,8 +403,15 @@ def build_user_prompt(keyword: str, group: pd.DataFrame, score_data: dict) -> st
         pattern_hint = (
             "\n\nNOTA: las URLs están en directorios de idioma diferentes. "
             "Esto suele NO ser canibalización real sino un problema de hreflang. "
-            "Recomienda revisar la implementación de hreflang antes que redirigir, "
-            "salvo que un idioma rankee para keywords del otro y reste tráfico."
+            "Usa la acción 'Revisar hreflang' salvo que compruebes que un idioma "
+            "rankea activamente para keywords del otro y le roba tráfico."
+        )
+    elif pattern == "Falta versión idioma":
+        pattern_hint = (
+            "\n\nNOTA: la home compite con una URL en un directorio de idioma. "
+            "Probablemente falta la versión hreflang correcta para ese idioma. "
+            "Usa la acción 'Revisar hreflang' y valida que la home tenga las "
+            "etiquetas hreflang apuntando a la versión de idioma correcta."
         )
 
     return (
@@ -417,16 +444,28 @@ def ask_claude(client: Anthropic, keyword: str, group: pd.DataFrame, score_data:
             if text.lower().startswith("json"):
                 text = text[4:].strip()
         data = json.loads(text)
+        diagnostico = data.get("diagnostico", "").strip()
+        accion_concreta = data.get("accion_concreta", "").strip()
+        resultado = data.get("resultado_esperado", "").strip()
+        # Componer justificación legible para columna Excel
+        partes = [p for p in [diagnostico, accion_concreta, resultado] if p]
+        justificacion = " | ".join(partes) if partes else data.get("justificacion", "").strip()
         return {
             "accion": data.get("accion", "").strip(),
             "url_principal": data.get("url_principal", "").strip(),
-            "justificacion": data.get("justificacion", "").strip(),
+            "justificacion": justificacion,
+            "diagnostico": diagnostico,
+            "accion_concreta": accion_concreta,
+            "resultado_esperado": resultado,
         }
     except (json.JSONDecodeError, APIError, Exception) as e:
         return {
             "accion": "Error",
             "url_principal": "",
             "justificacion": f"No se pudo generar recomendación ({type(e).__name__}).",
+            "diagnostico": "",
+            "accion_concreta": "",
+            "resultado_esperado": "",
         }
 
 
@@ -436,9 +475,18 @@ def ask_claude(client: Anthropic, keyword: str, group: pd.DataFrame, score_data:
 
 
 def build_excel(cannibal: pd.DataFrame, summary: pd.DataFrame) -> bytes:
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.utils import get_column_letter
+
     output = io.BytesIO()
+
+    # Añadir columna Estado al resumen si no existe
+    summary_out = summary.copy()
+    if "Estado" not in summary_out.columns:
+        summary_out.insert(summary_out.columns.get_loc("Acción") + 1, "Estado", "Pendiente")
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="Resumen", index=False)
+        summary_out.to_excel(writer, sheet_name="Resumen", index=False)
 
         detail_cols = [
             "keyword", "url", "best_position", "page_type", "intent", "pattern",
@@ -446,31 +494,57 @@ def build_excel(cannibal: pd.DataFrame, summary: pd.DataFrame) -> bytes:
         for opt in ("volume", "keyword_difficulty", "traffic"):
             if opt in cannibal.columns:
                 detail_cols.append(opt)
-
-        # Solo incluimos columnas que realmente existen
         detail_cols = [c for c in detail_cols if c in cannibal.columns]
 
-        merged = cannibal[detail_cols].merge(
-            summary[["keyword", "Severidad", "Score impacto", "Acción",
-                     "URL principal", "Justificación"]],
-            on="keyword",
-            how="left",
-        )
+        merge_cols = ["keyword", "Severidad", "Score impacto", "Acción", "URL principal", "Justificación"]
+        merge_cols = [c for c in merge_cols if c in summary_out.columns]
+        merged = cannibal[detail_cols].merge(summary_out[merge_cols], on="keyword", how="left")
         merged.to_excel(writer, sheet_name="Detalle", index=False)
 
+        # Hoja Diagnóstico si hay columnas de Claude estructuradas
+        diag_cols = ["keyword", "Diagnóstico", "Acción concreta", "Resultado esperado"]
+        diag_cols_present = [c for c in diag_cols if c in summary_out.columns]
+        if len(diag_cols_present) > 1:
+            diag_df = summary_out[diag_cols_present].copy()
+            diag_df.to_excel(writer, sheet_name="Diagnóstico", index=False)
+
+        # Hipervínculos en columna URL principal (Resumen) y url (Detalle)
+        ws_resumen = writer.sheets["Resumen"]
+        url_col_resumen = None
+        for idx, cell in enumerate(ws_resumen[1], start=1):
+            if cell.value == "URL principal":
+                url_col_resumen = idx
+                break
+        if url_col_resumen:
+            for row in ws_resumen.iter_rows(min_row=2, min_col=url_col_resumen, max_col=url_col_resumen):
+                cell = row[0]
+                if cell.value and str(cell.value).startswith("http"):
+                    cell.hyperlink = cell.value
+                    cell.font = Font(color="0563C1", underline="single")
+
+        ws_detalle = writer.sheets["Detalle"]
+        url_col_detalle = None
+        for idx, cell in enumerate(ws_detalle[1], start=1):
+            if cell.value == "url":
+                url_col_detalle = idx
+                break
+        if url_col_detalle:
+            for row in ws_detalle.iter_rows(min_row=2, min_col=url_col_detalle, max_col=url_col_detalle):
+                cell = row[0]
+                if cell.value and str(cell.value).startswith("http"):
+                    cell.hyperlink = cell.value
+                    cell.font = Font(color="0563C1", underline="single")
+
         # Auto-anchura
-        for sheet in ("Resumen", "Detalle"):
+        sev_colors = {"Alta": "F8B4B4", "Media": "FDE68A", "Baja": "BBF7D0"}
+        sheets_to_format = [s for s in ("Resumen", "Detalle", "Diagnóstico") if s in writer.sheets]
+        for sheet in sheets_to_format:
             ws = writer.sheets[sheet]
             for col in ws.columns:
-                length = max(
-                    (len(str(c.value)) if c.value is not None else 0) for c in col
-                )
-                ws.column_dimensions[col[0].column_letter].width = min(
-                    max(length + 2, 12), 60
-                )
+                length = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(length + 2, 12), 70)
 
-        # Coloreado de severidad en el Resumen
-        from openpyxl.styles import PatternFill
+        # Coloreado de severidad en Resumen
         ws = writer.sheets["Resumen"]
         sev_col = None
         for idx, cell in enumerate(ws[1], start=1):
@@ -478,14 +552,9 @@ def build_excel(cannibal: pd.DataFrame, summary: pd.DataFrame) -> bytes:
                 sev_col = idx
                 break
         if sev_col:
-            colors = {
-                "Alta": "F8B4B4",
-                "Media": "FDE68A",
-                "Baja": "BBF7D0",
-            }
             for row in ws.iter_rows(min_row=2, min_col=sev_col, max_col=sev_col):
                 cell = row[0]
-                fill = colors.get(cell.value)
+                fill = sev_colors.get(cell.value)
                 if fill:
                     cell.fill = PatternFill("solid", fgColor=fill)
 
@@ -575,7 +644,9 @@ def run_analysis(
         if "keyword_difficulty" in group.columns:
             kd_series = pd.to_numeric(group["keyword_difficulty"], errors="coerce")
             kd_series = kd_series.dropna()
-            kd_val = int(kd_series.max()) if not kd_series.empty else None
+            if not kd_series.empty:
+                max_kd = int(kd_series.max())
+                kd_val = max_kd if max_kd > 0 else None
 
         summary_records.append({
             "keyword": kw,
@@ -687,6 +758,9 @@ def run_analysis(
                     "Acción": "Pendiente (límite alcanzado)",
                     "URL principal": "",
                     "Justificación": "",
+                    "Diagnóstico": "",
+                    "Acción concreta": "",
+                    "Resultado esperado": "",
                 })
                 continue
 
@@ -697,13 +771,20 @@ def run_analysis(
                 "Acción": res["accion"],
                 "URL principal": res["url_principal"],
                 "Justificación": res["justificacion"],
+                "Diagnóstico": res["diagnostico"],
+                "Acción concreta": res["accion_concreta"],
+                "Resultado esperado": res["resultado_esperado"],
             })
             progress.progress((i + 1) / total, text=f"Analizando… {i + 1}/{total}")
             time.sleep(0.2)
         progress.empty()
     else:
         for kw in keywords_to_process:
-            actions_records.append({"keyword": kw, "Acción": "", "URL principal": "", "Justificación": ""})
+            actions_records.append({
+                "keyword": kw,
+                "Acción": "", "URL principal": "", "Justificación": "",
+                "Diagnóstico": "", "Acción concreta": "", "Resultado esperado": "",
+            })
 
     actions_df = pd.DataFrame(actions_records)
     final_summary = view.drop(columns=["Acción", "URL principal", "Justificación"]).merge(
