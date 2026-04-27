@@ -140,9 +140,9 @@ def classify_pattern(group: pd.DataFrame) -> str:
     """
     Clasifica el tipo de canibalización:
       - "Idiomas distintos": URLs en directorios de idioma diferentes
-        (ambas con prefijo de idioma claro, no la home).
-      - "Falta versión idioma": una URL en /en/ y otra es la home — no es un
-        problema de hreflang sino de cobertura de contenido.
+        (incluye home ES vs home EN — son traducciones legítimas).
+      - "Falta versión idioma": una URL en /en/ y otra es la home Y la home
+        NO está en idioma traducido — falta una página dedicada.
       - "Blog vs comercial": mezcla blog + categoría/producto/servicio.
       - "Producto vs categoría": un producto y una categoría compiten.
       - "Mismo tipo": todas comparten tipo (canibalización clásica).
@@ -153,19 +153,35 @@ def classify_pattern(group: pd.DataFrame) -> str:
     type_set = set(types)
 
     distinct_langs = set(langs)
-    has_home = "home" in type_set
-
-    # Idiomas distintos REAL: 2+ prefijos de idioma claros, sin contar 'default'
     explicit_langs = distinct_langs - {"default"}
+
+    # Caso: 2+ idiomas explícitos diferentes → siempre "Idiomas distintos"
     if len(explicit_langs) >= 2:
         return "Idiomas distintos"
 
-    # Si hay 1 idioma explícito + 1 default Y una URL es home → falta versión
-    if len(explicit_langs) == 1 and "default" in distinct_langs and has_home:
-        return "Falta versión idioma"
-
-    # Si hay 1 idioma explícito + 1 default sin home → idiomas distintos
+    # Caso especial: home + URL con prefijo de idioma
+    # → SOLO es "Falta versión idioma" si la home es la única URL sin prefijo
+    #   Y hay otra URL que NO es home con prefijo de idioma.
+    #   Si ambas son home (home/ + /en/), es traducción legítima.
     if len(explicit_langs) == 1 and "default" in distinct_langs:
+        # ¿Hay URLs que sean home y otras que no? Si todas las que tienen
+        # idioma explícito son home, entonces es "Idiomas distintos" (homes traducidas).
+        # Si la URL con idioma NO es home, falta versión.
+        page_types = group["page_type"].tolist() if "page_type" in group.columns else [None] * len(group)
+        urls_by_lang = list(zip(group["url"].tolist(), langs, page_types))
+        non_default_types = {pt for u, lg, pt in urls_by_lang if lg != "default"}
+        default_types = {pt for u, lg, pt in urls_by_lang if lg == "default"}
+
+        # Si todas las URLs (default y no default) son home → idiomas distintos
+        if non_default_types == {"home"} and default_types == {"home"}:
+            return "Idiomas distintos"
+        # Si la default es home pero la otra no → falta versión idioma
+        if "home" in default_types and "home" not in non_default_types:
+            return "Falta versión idioma"
+        # Si la no-default es home pero la default no → falta versión idioma (al revés)
+        if "home" in non_default_types and "home" not in default_types:
+            return "Falta versión idioma"
+        # Otros mixtos con un solo idioma explícito → idiomas distintos
         return "Idiomas distintos"
 
     if "blog" in type_set and (type_set & {"categoría", "producto", "servicio"}):
@@ -444,28 +460,23 @@ def ask_claude(client: Anthropic, keyword: str, group: pd.DataFrame, score_data:
             if text.lower().startswith("json"):
                 text = text[4:].strip()
         data = json.loads(text)
+        # Componer justificación: unir las 3 partes estructuradas si vienen,
+        # o usar el campo justificacion directamente si el modelo lo devuelve así.
         diagnostico = data.get("diagnostico", "").strip()
         accion_concreta = data.get("accion_concreta", "").strip()
         resultado = data.get("resultado_esperado", "").strip()
-        # Componer justificación legible para columna Excel
         partes = [p for p in [diagnostico, accion_concreta, resultado] if p]
-        justificacion = " | ".join(partes) if partes else data.get("justificacion", "").strip()
+        justif = " | ".join(partes) if partes else data.get("justificacion", "").strip()
         return {
             "accion": data.get("accion", "").strip(),
             "url_principal": data.get("url_principal", "").strip(),
-            "justificacion": justificacion,
-            "diagnostico": diagnostico,
-            "accion_concreta": accion_concreta,
-            "resultado_esperado": resultado,
+            "justificacion": justif or "Sin justificación.",
         }
     except (json.JSONDecodeError, APIError, Exception) as e:
         return {
             "accion": "Error",
             "url_principal": "",
             "justificacion": f"No se pudo generar recomendación ({type(e).__name__}).",
-            "diagnostico": "",
-            "accion_concreta": "",
-            "resultado_esperado": "",
         }
 
 
@@ -475,89 +486,222 @@ def ask_claude(client: Anthropic, keyword: str, group: pd.DataFrame, score_data:
 
 
 def build_excel(cannibal: pd.DataFrame, summary: pd.DataFrame) -> bytes:
-    from openpyxl.styles import PatternFill, Font
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
 
     output = io.BytesIO()
 
-    # Añadir columna Estado al resumen si no existe
-    summary_out = summary.copy()
-    if "Estado" not in summary_out.columns:
-        summary_out.insert(summary_out.columns.get_loc("Acción") + 1, "Estado", "Pendiente")
+    # Construimos el workbook manualmente para control fino sobre la hoja Diagnóstico
+    wb = Workbook()
+    wb.remove(wb.active)
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary_out.to_excel(writer, sheet_name="Resumen", index=False)
+    # ─── Hoja 1: Diagnóstico (resumen ejecutivo) ──────────────────────
+    ws_diag = wb.create_sheet("Diagnóstico")
 
-        detail_cols = [
-            "keyword", "url", "best_position", "page_type", "intent", "pattern",
-        ]
-        for opt in ("volume", "keyword_difficulty", "traffic"):
-            if opt in cannibal.columns:
-                detail_cols.append(opt)
-        detail_cols = [c for c in detail_cols if c in cannibal.columns]
+    # Estilos reutilizables
+    title_font = Font(bold=True, size=16, color="1D3557")
+    section_font = Font(bold=True, size=12, color="E63946")
+    label_font = Font(bold=True, size=11)
+    body_font = Font(size=11)
+    wrap_align = Alignment(wrap_text=True, vertical="top")
 
-        merge_cols = ["keyword", "Severidad", "Score impacto", "Acción", "URL principal", "Justificación"]
-        merge_cols = [c for c in merge_cols if c in summary_out.columns]
-        merged = cannibal[detail_cols].merge(summary_out[merge_cols], on="keyword", how="left")
-        merged.to_excel(writer, sheet_name="Detalle", index=False)
+    # Cabecera
+    ws_diag["A1"] = "Diagnóstico de Canibalizaciones SEO"
+    ws_diag["A1"].font = title_font
+    ws_diag.merge_cells("A1:E1")
+    row = 3
 
-        # Hoja Diagnóstico si hay columnas de Claude estructuradas
-        diag_cols = ["keyword", "Diagnóstico", "Acción concreta", "Resultado esperado"]
-        diag_cols_present = [c for c in diag_cols if c in summary_out.columns]
-        if len(diag_cols_present) > 1:
-            diag_df = summary_out[diag_cols_present].copy()
-            diag_df.to_excel(writer, sheet_name="Diagnóstico", index=False)
+    # Bloque 1: totales
+    ws_diag.cell(row=row, column=1, value="RESUMEN").font = section_font
+    row += 1
+    ws_diag.cell(row=row, column=1, value="Total de canibalizaciones").font = label_font
+    ws_diag.cell(row=row, column=2, value=len(summary))
+    row += 1
+    sev_counts = summary["Severidad"].value_counts()
+    for sev, color in [("Alta", "F8B4B4"), ("Media", "FDE68A"), ("Baja", "BBF7D0")]:
+        ws_diag.cell(row=row, column=1, value=f"  Severidad {sev}").font = label_font
+        c = ws_diag.cell(row=row, column=2, value=int(sev_counts.get(sev, 0)))
+        c.fill = PatternFill("solid", fgColor=color)
+        row += 1
+    row += 1
 
-        # Hipervínculos en columna URL principal (Resumen) y url (Detalle)
-        ws_resumen = writer.sheets["Resumen"]
-        url_col_resumen = None
-        for idx, cell in enumerate(ws_resumen[1], start=1):
-            if cell.value == "URL principal":
-                url_col_resumen = idx
-                break
-        if url_col_resumen:
-            for row in ws_resumen.iter_rows(min_row=2, min_col=url_col_resumen, max_col=url_col_resumen):
-                cell = row[0]
-                if cell.value and str(cell.value).startswith("http"):
-                    cell.hyperlink = cell.value
-                    cell.font = Font(color="0563C1", underline="single")
+    # Bloque 2: distribución por patrón
+    ws_diag.cell(row=row, column=1, value="DISTRIBUCIÓN POR PATRÓN").font = section_font
+    row += 1
+    pattern_counts = summary["Patrón"].value_counts()
+    for pattern, count in pattern_counts.items():
+        pct = count / len(summary) * 100
+        ws_diag.cell(row=row, column=1, value=f"  {pattern}").font = body_font
+        ws_diag.cell(row=row, column=2, value=f"{count} ({pct:.0f}%)").font = body_font
+        row += 1
+    row += 1
 
-        ws_detalle = writer.sheets["Detalle"]
-        url_col_detalle = None
-        for idx, cell in enumerate(ws_detalle[1], start=1):
-            if cell.value == "url":
-                url_col_detalle = idx
-                break
-        if url_col_detalle:
-            for row in ws_detalle.iter_rows(min_row=2, min_col=url_col_detalle, max_col=url_col_detalle):
-                cell = row[0]
-                if cell.value and str(cell.value).startswith("http"):
-                    cell.hyperlink = cell.value
-                    cell.font = Font(color="0563C1", underline="single")
+    # Bloque 3: conclusión accionable si hay un patrón dominante
+    if len(pattern_counts) > 0:
+        top_pattern = pattern_counts.index[0]
+        top_count = pattern_counts.iloc[0]
+        top_pct = top_count / len(summary) * 100
+        if top_pct >= 40:
+            ws_diag.cell(row=row, column=1, value="CONCLUSIÓN ACCIONABLE").font = section_font
+            row += 1
+            conclusion_map = {
+                "Idiomas distintos": (
+                    f"El {top_pct:.0f}% de las canibalizaciones se deben a directorios "
+                    f"de idioma compitiendo entre sí. Probable causa raíz: "
+                    f"implementación incorrecta de hreflang.\n\n"
+                    f"PRIORIDAD: revisar hreflang en todo el sitio antes de actuar "
+                    f"caso por caso. Una sola corrección técnica resuelve {top_count} "
+                    f"de las {len(summary)} canibalizaciones detectadas."
+                ),
+                "Falta versión idioma": (
+                    f"El {top_pct:.0f}% de los casos son por falta de contenido en el "
+                    f"idioma de la búsqueda.\n\n"
+                    f"PRIORIDAD: crear las páginas dedicadas que faltan. La estructura "
+                    f"de la web tiene huecos en el idioma de las búsquedas detectadas."
+                ),
+                "Blog vs comercial": (
+                    f"El {top_pct:.0f}% son blog canibalizando páginas comerciales.\n\n"
+                    f"PRIORIDAD: diferenciar intenciones y corregir enlazado interno "
+                    f"para que cada URL atraiga su tipo de búsqueda."
+                ),
+                "Producto vs categoría": (
+                    f"El {top_pct:.0f}% son producto vs categoría.\n\n"
+                    f"PRIORIDAD: definir cuál es la URL principal para cada keyword "
+                    f"y redirigir o canonicalizar."
+                ),
+            }
+            conclusion = conclusion_map.get(
+                top_pattern,
+                f"El patrón dominante es «{top_pattern}» ({top_pct:.0f}%)."
+            )
+            cell = ws_diag.cell(row=row, column=1, value=conclusion)
+            cell.font = body_font
+            cell.alignment = wrap_align
+            ws_diag.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+            ws_diag.row_dimensions[row].height = 80
+            row += 2
 
-        # Auto-anchura
-        sev_colors = {"Alta": "F8B4B4", "Media": "FDE68A", "Baja": "BBF7D0"}
-        sheets_to_format = [s for s in ("Resumen", "Detalle", "Diagnóstico") if s in writer.sheets]
-        for sheet in sheets_to_format:
-            ws = writer.sheets[sheet]
-            for col in ws.columns:
-                length = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-                ws.column_dimensions[col[0].column_letter].width = min(max(length + 2, 12), 70)
+    # Bloque 4: top 3 acciones críticas (mayor score de impacto)
+    ws_diag.cell(row=row, column=1, value="TOP 3 ACCIONES CRÍTICAS (mayor score de impacto)").font = section_font
+    row += 1
+    headers = ["#", "Keyword", "Patrón", "Acción", "Score"]
+    for i, h in enumerate(headers, 1):
+        c = ws_diag.cell(row=row, column=i, value=h)
+        c.fill = PatternFill("solid", fgColor="1D3557")
+        c.font = Font(bold=True, color="FFFFFF")
+    row += 1
+    for i, (_, r) in enumerate(summary.head(3).iterrows(), 1):
+        ws_diag.cell(row=row, column=1, value=i)
+        ws_diag.cell(row=row, column=2, value=r["keyword"])
+        ws_diag.cell(row=row, column=3, value=r["Patrón"])
+        ws_diag.cell(row=row, column=4, value=r.get("Acción", ""))
+        ws_diag.cell(row=row, column=5, value=r.get("Score impacto", ""))
+        row += 1
 
-        # Coloreado de severidad en Resumen
-        ws = writer.sheets["Resumen"]
-        sev_col = None
-        for idx, cell in enumerate(ws[1], start=1):
-            if cell.value == "Severidad":
-                sev_col = idx
-                break
-        if sev_col:
-            for row in ws.iter_rows(min_row=2, min_col=sev_col, max_col=sev_col):
-                cell = row[0]
-                fill = sev_colors.get(cell.value)
-                if fill:
-                    cell.fill = PatternFill("solid", fgColor=fill)
+    # Anchuras hoja Diagnóstico
+    ws_diag.column_dimensions["A"].width = 50
+    ws_diag.column_dimensions["B"].width = 30
+    ws_diag.column_dimensions["C"].width = 25
+    ws_diag.column_dimensions["D"].width = 22
+    ws_diag.column_dimensions["E"].width = 12
 
+    # ─── Hoja 2: Resumen ────────────────────────────────────────────
+    ws_resumen = wb.create_sheet("Resumen")
+    if "Estado" not in summary.columns:
+        summary = summary.copy()
+        summary["Estado"] = "Pendiente"
+
+    for col_idx, col_name in enumerate(summary.columns, 1):
+        ws_resumen.cell(row=1, column=col_idx, value=col_name).font = Font(bold=True)
+    for row_idx, (_, r) in enumerate(summary.iterrows(), 2):
+        for col_idx, col_name in enumerate(summary.columns, 1):
+            val = r[col_name]
+            if pd.isna(val):
+                val = ""
+            ws_resumen.cell(row=row_idx, column=col_idx, value=val)
+
+    # Coloreado de severidad
+    sev_colors = {"Alta": "F8B4B4", "Media": "FDE68A", "Baja": "BBF7D0"}
+    sev_col = None
+    for idx, cell in enumerate(ws_resumen[1], start=1):
+        if cell.value == "Severidad":
+            sev_col = idx
+            break
+    if sev_col:
+        for row_cells in ws_resumen.iter_rows(min_row=2, min_col=sev_col, max_col=sev_col):
+            cell = row_cells[0]
+            fill = sev_colors.get(cell.value)
+            if fill:
+                cell.fill = PatternFill("solid", fgColor=fill)
+
+    # Hipervínculos en URL principal (Resumen)
+    url_col_res = None
+    for idx, cell in enumerate(ws_resumen[1], start=1):
+        if cell.value == "URL principal":
+            url_col_res = idx
+            break
+    if url_col_res:
+        link_font = Font(color="0563C1", underline="single")
+        for row_cells in ws_resumen.iter_rows(min_row=2, min_col=url_col_res, max_col=url_col_res):
+            cell = row_cells[0]
+            if cell.value and isinstance(cell.value, str) and cell.value.startswith("http"):
+                cell.hyperlink = cell.value
+                cell.font = link_font
+
+    # Auto-anchura Resumen
+    for col in ws_resumen.columns:
+        col_letter = get_column_letter(col[0].column)
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        ws_resumen.column_dimensions[col_letter].width = min(max(length + 2, 12), 60)
+
+    # ─── Hoja 3: Detalle ────────────────────────────────────────────
+    ws_detalle = wb.create_sheet("Detalle")
+    detail_cols = [
+        "keyword", "url", "best_position", "page_type", "intent", "pattern",
+    ]
+    for opt in ("volume", "keyword_difficulty", "traffic"):
+        if opt in cannibal.columns:
+            detail_cols.append(opt)
+    detail_cols = [c for c in detail_cols if c in cannibal.columns]
+    merged = cannibal[detail_cols].merge(
+        summary[["keyword", "Severidad", "Score impacto", "Acción",
+                 "URL principal", "Justificación"]],
+        on="keyword",
+        how="left",
+    )
+    merged["Estado"] = "Pendiente"
+
+    for col_idx, col_name in enumerate(merged.columns, 1):
+        ws_detalle.cell(row=1, column=col_idx, value=col_name).font = Font(bold=True)
+    for row_idx, (_, r) in enumerate(merged.iterrows(), 2):
+        for col_idx, col_name in enumerate(merged.columns, 1):
+            val = r[col_name]
+            if pd.isna(val):
+                val = ""
+            ws_detalle.cell(row=row_idx, column=col_idx, value=val)
+
+    # Hipervínculos en url (Detalle)
+    url_col_det = None
+    for idx, cell in enumerate(ws_detalle[1], start=1):
+        if cell.value == "url":
+            url_col_det = idx
+            break
+    if url_col_det:
+        link_font = Font(color="0563C1", underline="single")
+        for row_cells in ws_detalle.iter_rows(min_row=2, min_col=url_col_det, max_col=url_col_det):
+            cell = row_cells[0]
+            if cell.value and isinstance(cell.value, str) and cell.value.startswith("http"):
+                cell.hyperlink = cell.value
+                cell.font = link_font
+
+    # Auto-anchura Detalle
+    for col in ws_detalle.columns:
+        col_letter = get_column_letter(col[0].column)
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+        ws_detalle.column_dimensions[col_letter].width = min(max(length + 2, 12), 60)
+
+    wb.save(output)
     return output.getvalue()
 
 
@@ -661,6 +805,7 @@ def run_analysis(
             "Acción": "",
             "URL principal": "",
             "Justificación": "",
+            "Estado": "Pendiente",
         })
     summary = pd.DataFrame(summary_records).sort_values(
         by=["Severidad", "Score impacto"],
@@ -758,9 +903,6 @@ def run_analysis(
                     "Acción": "Pendiente (límite alcanzado)",
                     "URL principal": "",
                     "Justificación": "",
-                    "Diagnóstico": "",
-                    "Acción concreta": "",
-                    "Resultado esperado": "",
                 })
                 continue
 
@@ -771,9 +913,6 @@ def run_analysis(
                 "Acción": res["accion"],
                 "URL principal": res["url_principal"],
                 "Justificación": res["justificacion"],
-                "Diagnóstico": res["diagnostico"],
-                "Acción concreta": res["accion_concreta"],
-                "Resultado esperado": res["resultado_esperado"],
             })
             progress.progress((i + 1) / total, text=f"Analizando… {i + 1}/{total}")
             time.sleep(0.2)
@@ -783,7 +922,6 @@ def run_analysis(
             actions_records.append({
                 "keyword": kw,
                 "Acción": "", "URL principal": "", "Justificación": "",
-                "Diagnóstico": "", "Acción concreta": "", "Resultado esperado": "",
             })
 
     actions_df = pd.DataFrame(actions_records)
